@@ -6,34 +6,30 @@ import pickle
 import logging
 import requests
 import threading
-from flask import Flask, render_template_string, jsonify, request
 
 import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
-app = Flask(__name__)
-
-# أسماء الملفات المحلية
+# أسماء الملفات المحفوظة
 CONFIG_FILE = "config.json"
 COOKIES_FILE = "bls_cookies.pkl"
 SCREENSHOT_FILE = "bls_appointment.png"
 
-# قفل التزامن بين الخيوط
 data_lock = threading.Lock()
 
-# الإعدادات الافتراضية الخاصة بـ BLS Spain - الجزائر
+# الإعدادات الافتراضية
 DEFAULT_CONFIG = {
     "is_running": False,
     "logs": [],
     "bot_token": "8852242734:AAEfwhcKbUFsixdp_uoRCpi_f64-5YloYPY",
-    "chat_id": "8080040850",
+    "chat_id": "8080040850",  # سيتم قبول الأوامر فقط من هذا المعرف للأمان
     "login_url": "https://algeria.blsspainvisa.com/algiers/",
     "app_url": "https://algeria.blsspainvisa.com/algiers/book-appointment",
     "email": "your_email@example.com",
     "password": "your_password",
-    "headless": False,  # يُوصى بـ False لموقع BLS لتجاوز Cloudflare
+    "headless": False,
     "check_interval_min": 180,
     "check_interval_max": 300
 }
@@ -64,35 +60,46 @@ def add_log(message):
         if len(bot_status["logs"]) > 100:
             bot_status["logs"].pop(0)
 
-def send_telegram(msg, image_path=None):
+# --- إرسال رسائل وتغيير الواجهات في التلغرام ---
+
+def send_telegram(msg, image_path=None, show_keyboard=True):
+    """إرسال رسائل أو صور للتلغرام مع لوحة الأزرار."""
     token = bot_status.get("bot_token")
     chat_id = bot_status.get("chat_id")
 
     if not token or not chat_id:
-        add_log("⚠️ بيانات التلغرام غير مكتملة.")
+        print("⚠️ بيانات التلغرام غير مكتملة.")
         return False
+
+    # لوحة الأزرار التفاعلية أسفل المحادثة
+    keyboard = {
+        "keyboard": [
+            [{"text": "▶️ بدء المراقبة"}, {"text": "⏹️ إيقاف المراقبة"}],
+            [{"text": "⚡ فحص فوري الآن"}, {"text": "📊 حالة البوت والسجلات"}]
+        ],
+        "resize_keyboard": True,
+        "persistent": True
+    } if show_keyboard else None
 
     try:
         if image_path and os.path.exists(image_path):
             url = f"https://api.telegram.org/bot{token}/sendPhoto"
             with open(image_path, "rb") as photo:
-                res = requests.post(
-                    url,
-                    data={"chat_id": chat_id, "caption": msg, "parse_mode": "Markdown"},
-                    files={"photo": photo},
-                    timeout=15
-                )
+                payload = {"chat_id": chat_id, "caption": msg, "parse_mode": "Markdown"}
+                if keyboard: payload["reply_markup"] = json.dumps(keyboard)
+                res = requests.post(url, data=payload, files={"photo": photo}, timeout=15)
         else:
             url = f"https://api.telegram.org/bot{token}/sendMessage"
-            res = requests.post(
-                url,
-                json={"chat_id": chat_id, "text": msg, "parse_mode": "Markdown"},
-                timeout=10
-            )
+            payload = {"chat_id": chat_id, "text": msg, "parse_mode": "Markdown"}
+            if keyboard: payload["reply_markup"] = json.dumps(keyboard)
+            res = requests.post(url, json=payload, timeout=10)
+            
         return res.status_code == 200
     except Exception as e:
         add_log(f"خطأ إرسال تلغرام: {e}")
         return False
+
+# --- محرك البحث وفتح المتصفح ---
 
 def get_chromedriver():
     options = uc.ChromeOptions()
@@ -113,15 +120,13 @@ def get_chromedriver():
 def run_visa_check():
     driver = None
     try:
-        add_log("🔍 جاري فتح موقع BLS Spain (الجزائر)...")
+        add_log("🔍 جاري فحص موقع BLS Spain...")
         driver = get_chromedriver()
         wait = WebDriverWait(driver, 20)
 
-        # 1. فتح الصفحة الرئيسية
         driver.get(bot_status["login_url"])
         time.sleep(3)
 
-        # تطبيق الكوكيز السابقة إن وجدت
         if os.path.exists(COOKIES_FILE):
             try:
                 with open(COOKIES_FILE, "rb") as f:
@@ -129,36 +134,31 @@ def run_visa_check():
                         driver.add_cookie(c)
                 driver.refresh()
                 time.sleep(3)
-                add_log("تم تحميل الجلسة المحفوظة عبر الكوكيز.")
+                add_log("تم استعادة الجلسة بنجاح.")
             except Exception as e:
-                add_log(f"تعذر استعادة الكوكيز: {e}")
+                add_log(f"خطأ في استعادة الكوكيز: {e}")
 
-        # 2. الانتقال إلى صفحة المواعيد
         driver.get(bot_status["app_url"])
         time.sleep(5)
 
-        # حفظ الكوكيز الحالية لاستمرار الجلسة
         try:
             with open(COOKIES_FILE, "wb") as f:
                 pickle.dump(driver.get_cookies(), f)
         except Exception:
             pass
 
-        # 3. فحص خانات المواعيد المتاحة
-        # البحث عن عناصر المواعيد المتاحة أو خانات الاختيار النشطة في BLS
         available_slots = driver.find_elements(By.XPATH, "//td[contains(@class, 'day') and not(contains(@class, 'disabled'))]")
         if not available_slots:
             available_slots = driver.find_elements(By.CLASS_NAME, "available-slot")
 
         if len(available_slots) > 0:
-            msg = f"🚨 *تم العثور على مواعيد متاحة في BLS Spain (الجزائر)!*\nعدد الخانات المتاحة: {len(available_slots)}\nرابط الموقع: {bot_status['app_url']}"
+            msg = f"🚨 *تم العثور على مواعيد متاحة!*\nالعدد: {len(available_slots)}\nالرابط: {bot_status['app_url']}"
             add_log(msg)
             
-            # التقاط صورة وإرسالها تلغرام
             driver.save_screenshot(SCREENSHOT_FILE)
             send_telegram(msg, image_path=SCREENSHOT_FILE)
         else:
-            add_log("لا توجد مواعيد متاحة حالياً على موقع BLS.")
+            add_log("لا توجد مواعيد متاحة حالياً.")
 
     except Exception as e:
         add_log(f"حدث خطأ أثناء الفحص: {e}")
@@ -170,7 +170,7 @@ def run_visa_check():
                 pass
 
 def bot_loop():
-    send_telegram("🌐 *تم تشغيل البوت لمراقبة مواعيد BLS Spain (الجزائر)!*")
+    send_telegram("🚀 *تم تفعيل المراقبة التلقائية للمواعيد!*")
     
     while bot_status["is_running"]:
         run_visa_check()
@@ -179,194 +179,81 @@ def bot_loop():
             break
             
         delay = random.uniform(bot_status.get("check_interval_min", 180), bot_status.get("check_interval_max", 300))
-        add_log(f"انتظار {int(delay)} ثانية حتى الجولة القادمة...")
+        add_log(f"انتظار {int(delay)} ثانية للجولة القادمة...")
         
         for _ in range(int(delay)):
             if not bot_status["is_running"]:
                 break
             time.sleep(1)
 
-    send_telegram("🛑 *تم إيقاف تشغيل بوت المواعيد.*")
+    send_telegram("🛑 *تم إيقاف المراقبة التلقائية.*")
 
-# --- الواجهة الخاصة بالسيرفر ---
-HTML_TEMPLATE = """
-<!DOCTYPE html>
-<html lang="ar" dir="rtl">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>لوحة بوت مواعيد BLS Spain - الجزائر</title>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.rtl.min.css" rel="stylesheet">
-    <style>
-        body { background-color: #f4f6f9; font-family: system-ui, -apple-system, sans-serif; }
-        .log-box { background: #1e1e1e; color: #00ff66; font-family: monospace; height: 260px; overflow-y: scroll; padding: 12px; border-radius: 6px; font-size: 13px; line-height: 1.5; }
-        .card { border-radius: 10px; border: none; box-shadow: 0 2px 10px rgba(0,0,0,0.08); }
-    </style>
-</head>
-<body class="p-2 p-md-4">
-    <div class="container card p-3 p-md-4 bg-white" style="max-width: 600px;">
-        <h4 class="text-center mb-3 text-danger">🇪🇸 لوحة بوت مواعيد BLS Spain (الجزائر)</h4>
+# --- الاستماع لأوامر التلغرام (Telegram Listener) ---
+
+def handle_command(text, sender_id):
+    """معالجة الأوامر الواردة من التلغرام."""
+    # التأكد من أن الأمر قادم من صاحب البوت المصرح له فقط
+    if str(sender_id) != str(bot_status["chat_id"]):
+        print(f"محاولة وصول غير مصرح بها من Chat ID: {sender_id}")
+        return
+
+    text = text.strip()
+
+    if text in ["/start", "أهلا", "مرحبا"]:
+        send_telegram("👋 *مرحباً بك في بوت مراقبة مواعيد BLS Spain!*\nاختر إجراءً من الأزرار أدناه:")
+
+    elif text in ["▶️ بدء المراقبة", "/start_bot"]:
+        if not bot_status["is_running"]:
+            bot_status["is_running"] = True
+            threading.Thread(target=bot_loop, daemon=True).start()
+        else:
+            send_telegram("⚠️ البوت يعمل بالفعل ويراقب المواعيد حالياً.")
+
+    elif text in ["⏹️ إيقاف المراقبة", "/stop_bot"]:
+        if bot_status["is_running"]:
+            bot_status["is_running"] = False
+            send_telegram("⏳ جاري إيقاف المراقبة...")
+        else:
+            send_telegram("⚠️ البوت متوقف بالفعل.")
+
+    elif text in ["⚡ فحص فوري الآن", "/check"]:
+        send_telegram("⚡ جاري تنفيذ فحص فوري الآن...")
+        threading.Thread(target=run_visa_check, daemon=True).start()
+
+    elif text in ["📊 حالة البوت والسجلات", "/status"]:
+        status_txt = "✅ يعمل ويراقب" if bot_status["is_running"] else "🛑 متوقف"
+        recent_logs = "\n".join(bot_status["logs"][-6:]) if bot_status["logs"] else "لا توجد سجلات بعد."
         
-        <div class="alert text-center fw-bold" id="statusBadge">جاري التحميل...</div>
+        msg = f"📌 *حالة البوت:* {status_txt}\n\n📝 *آخر السجلات:*\n```\n{recent_logs}\n```"
+        send_telegram(msg)
 
-        <div class="row g-2 mb-3">
-            <div class="col-6">
-                <button class="btn btn-success w-100 btn-lg" onclick="controlBot('start')">▶ بدء المراقبة</button>
-            </div>
-            <div class="col-6">
-                <button class="btn btn-danger w-100 btn-lg" onclick="controlBot('stop')">⏹ إيقاف البوت</button>
-            </div>
-            <div class="col-6">
-                <button class="btn btn-warning w-100 text-dark" onclick="controlBot('check_now')">⚡ فحص فوري الآن</button>
-            </div>
-            <div class="col-6">
-                <button class="btn btn-info w-100 text-white" onclick="testTelegram()">📩 اختبار التلغرام</button>
-            </div>
-        </div>
+def listen_telegram_updates():
+    """الاستماع للرسائل الواردة عبر Telegram Long-Polling."""
+    token = bot_status["bot_token"]
+    offset = 0
+    print("🤖 بدأ البوت بالاستماع لأوامر التلغرام...")
 
-        <form id="configForm" class="mb-3">
-            <div class="mb-2">
-                <label class="form-label fw-bold">رابط الموقع (BLS Home):</label>
-                <input type="url" class="form-control" name="login_url" value="{{ config.login_url }}" required>
-            </div>
-            <div class="mb-2">
-                <label class="form-label fw-bold">رابط صفحة حجز المواعيد (Appointments URL):</label>
-                <input type="url" class="form-control" name="app_url" value="{{ config.app_url }}" required>
-            </div>
-            <hr>
-            <div class="row g-2 mb-2">
-                <div class="col-6">
-                    <label class="form-label">البريد الإلكتروني:</label>
-                    <input type="email" class="form-control" name="email" value="{{ config.email }}">
-                </div>
-                <div class="col-6">
-                    <label class="form-label">كلمة المرور:</label>
-                    <input type="password" class="form-control" name="password" value="{{ config.password }}">
-                </div>
-            </div>
-            <div class="row g-2 mb-2">
-                <div class="col-6">
-                    <label class="form-label">Telegram Token:</label>
-                    <input type="text" class="form-control" name="bot_token" value="{{ config.bot_token }}">
-                </div>
-                <div class="col-6">
-                    <label class="form-label">Chat ID:</label>
-                    <input type="text" class="form-control" name="chat_id" value="{{ config.chat_id }}">
-                </div>
-            </div>
-            <div class="form-check form-switch my-3">
-                <input class="form-check-input" type="checkbox" name="headless" id="headlessSwitch" {% if config.headless %}checked{% endif %}>
-                <label class="form-check-label fw-bold" for="headlessSwitch">التشغيل المخفي بدون نافذة (غير موصى به مع BLS)</label>
-            </div>
-            <button type="button" class="btn btn-primary w-100 mt-2 fw-bold" onclick="saveConfig()">💾 حفظ الإعدادات</button>
-        </form>
+    while True:
+        try:
+            url = f"https://api.telegram.org/bot{token}/getUpdates?offset={offset}&timeout=20"
+            res = requests.get(url, timeout=25).json()
 
-        <div class="d-flex justify-content-between align-items-center mb-2">
-            <h6 class="m-0">سجل العمليات (Logs)</h6>
-            <button class="btn btn-sm btn-outline-secondary" onclick="clearLogs()">مسح السجل</button>
-        </div>
-        <div class="log-box" id="logBox"></div>
-    </div>
+            if res.get("ok"):
+                for update in res.get("result", []):
+                    offset = update["update_id"] + 1
+                    message = update.get("message", {})
+                    text = message.get("text", "")
+                    sender_id = message.get("chat", {}).get("id")
 
-    <script>
-        function updateUI() {
-            fetch('/api/status')
-                .then(r => r.json())
-                .then(data => {
-                    const badge = document.getElementById('statusBadge');
-                    if(data.is_running) {
-                        badge.className = 'alert alert-success text-center fw-bold';
-                        badge.innerText = 'الحالة: يعمل ويراقب...';
-                    } else {
-                        badge.className = 'alert alert-danger text-center fw-bold';
-                        badge.innerText = 'الحالة: متوقف';
-                    }
-                    const logBox = document.getElementById('logBox');
-                    logBox.innerHTML = data.logs.join('<br>');
-                    logBox.scrollTop = logBox.scrollHeight;
-                });
-        }
+                    if text and sender_id:
+                        handle_command(text, sender_id)
 
-        function controlBot(action) {
-            fetch('/api/' + action, {method: 'POST'}).then(() => updateUI());
-        }
-
-        function testTelegram() {
-            fetch('/api/test_telegram', {method: 'POST'})
-                .then(r => r.json())
-                .then(d => alert(d.message));
-        }
-
-        function clearLogs() {
-            fetch('/api/clear_logs', {method: 'POST'}).then(() => updateUI());
-        }
-
-        function saveConfig() {
-            const formData = new FormData(document.getElementById('configForm'));
-            formData.set('headless', document.getElementById('headlessSwitch').checked);
-            fetch('/api/save', {method: 'POST', body: formData})
-                .then(() => alert('تم حفظ بيانات BLS بنجاح!'));
-        }
-
-        setInterval(updateUI, 3000);
-        updateUI();
-    </script>
-</body>
-</html>
-"""
-
-# --- مارات API ---
-
-@app.route('/')
-def index():
-    return render_template_string(HTML_TEMPLATE, config=bot_status)
-
-@app.route('/api/status')
-def get_status():
-    return jsonify({"is_running": bot_status["is_running"], "logs": bot_status["logs"]})
-
-@app.route('/api/start', methods=['POST'])
-def start_bot():
-    if not bot_status["is_running"]:
-        bot_status["is_running"] = True
-        threading.Thread(target=bot_loop, daemon=True).start()
-    return jsonify({"success": True})
-
-@app.route('/api/stop', methods=['POST'])
-def stop_bot():
-    bot_status["is_running"] = False
-    return jsonify({"success": True})
-
-@app.route('/api/check_now', methods=['POST'])
-def check_now():
-    threading.Thread(target=run_visa_check, daemon=True).start()
-    return jsonify({"success": True})
-
-@app.route('/api/test_telegram', methods=['POST'])
-def test_telegram_route():
-    ok = send_telegram("🧪 *رسالة تجريبية من بوت مواعيد BLS Spain.*")
-    msg = "تم إرسال الرسالة بنجاح!" if ok else "فشل الإرسال، تحقق من بيانات التلغرام."
-    return jsonify({"message": msg})
-
-@app.route('/api/clear_logs', methods=['POST'])
-def clear_logs():
-    with data_lock:
-        bot_status["logs"] = []
-    return jsonify({"success": True})
-
-@app.route('/api/save', methods=['POST'])
-def save_config():
-    bot_status["login_url"] = request.form.get("login_url")
-    bot_status["app_url"] = request.form.get("app_url")
-    bot_status["email"] = request.form.get("email")
-    bot_status["password"] = request.form.get("password")
-    bot_status["bot_token"] = request.form.get("bot_token")
-    bot_status["chat_id"] = request.form.get("chat_id")
-    bot_status["headless"] = request.form.get("headless") == 'true'
-    
-    save_config_to_file()
-    return jsonify({"success": True})
+        except Exception as e:
+            time.sleep(3)
 
 if __name__ == '__main__':
-    add_log("تم تشغيل لوحة التحكم لبوت BLS Spain.")
-    app.run(host='0.0.0.0', port=5000)
+    # إرسال أزرار التحكم فور تشغيل السكريبت
+    send_telegram("🤖 *تم تشغيل السكريبت بنجاح!* استخدم الأزرار أدناه للتحكم:")
+    
+    # تشغيل الاستماع في الخيط الرئيسي
+    listen_telegram_updates()
