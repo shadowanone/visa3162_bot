@@ -1,347 +1,372 @@
-#!/usr/bin/env python3
 import os
-import sys
+import time
+import json
+import random
+import pickle
 import logging
-import sqlite3
-import asyncio
-import aiohttp
+import requests
 import threading
-from datetime import datetime
-from zoneinfo import ZoneInfo
-from flask import Flask
-from dotenv import load_dotenv
-from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+from flask import Flask, render_template_string, jsonify, request
 
-# تحميل المتغيرات البيئية
-load_dotenv()
+import undetected_chromedriver as uc
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 
-# إعداد التسجيل (Logging)
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler(sys.stdout)]
-)
-logger = logging.getLogger(__name__)
+app = Flask(__name__)
 
-# --- إعداد خادم Flask لتجاوز فحص المنفذ على Render ---
-flask_app = Flask(__name__)
+# أسماء الملفات المحلية
+CONFIG_FILE = "config.json"
+COOKIES_FILE = "bls_cookies.pkl"
+SCREENSHOT_FILE = "bls_appointment.png"
 
-@flask_app.route('/')
-def home():
-    return "✅ Telegram Visa Bot (Multi-User) is active!"
+# قفل التزامن بين الخيوط
+data_lock = threading.Lock()
 
-def run_flask():
-    port = int(os.environ.get("PORT", 8080))
-    flask_app.run(host="0.0.0.0", port=port)
-
-# --- إعداد قاعدة بيانات SQLite ---
-DB_NAME = "bot_users.db"
-
-def init_db():
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS users (
-                chat_id INTEGER PRIMARY KEY,
-                country TEXT,
-                city TEXT,
-                frequency INTEGER DEFAULT 5,
-                is_active INTEGER DEFAULT 0
-            )
-        ''')
-        conn.commit()
-
-def update_user(chat_id, **kwargs):
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        cursor.execute("INSERT OR IGNORE INTO users (chat_id) VALUES (?)", (chat_id,))
-        for key, value in kwargs.items():
-            cursor.execute(f"UPDATE users SET {key} = ? WHERE chat_id = ?", (value, chat_id))
-        conn.commit()
-
-def get_user(chat_id):
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT country, city, frequency, is_active FROM users WHERE chat_id = ?", (chat_id,))
-        row = cursor.fetchone()
-        return {"country": row[0], "city": row[1], "frequency": row[2], "is_active": row[3]} if row else None
-
-def get_all_active_users():
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT chat_id, country, city, frequency FROM users WHERE is_active = 1")
-        return cursor.fetchall()
-
-# --- الثوابت والإعدادات ---
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-API_URL = "https://api.schengenvisaappointments.com/api/visa-list/?format=json"
-
-COUNTRIES = {
-    'Spain': 'İspanya',
-    'France': 'Fransa',
-    'Netherlands': 'Hollanda',
-    'Ireland': 'İrlanda',
-    'Malta': 'Malta',
-    'Sweden': 'İsveç',
-    'Czechia': 'Çekya',
-    'Croatia': 'Hırvatistan',
-    'Bulgaria': 'Bulgaristan',
-    'Finland': 'Finlandiya',
-    'Slovenia': 'Slovenya',
-    'Denmark': 'Danimarka',
-    'Norway': 'Norveç',
-    'Estonia': 'Estonya',
-    'Lithuania': 'Litvanya',
-    'Luxembourg': 'Lüksemburg',
-    'Ukraine': 'Ukrayna',
-    'Latvia': 'Letonya'
+# الإعدادات الافتراضية الخاصة بـ BLS Spain - الجزائر
+DEFAULT_CONFIG = {
+    "is_running": False,
+    "logs": [],
+    "bot_token": "8852242734:AAEfwhcKbUFsixdp_uoRCpi_f64-5YloYPY",
+    "chat_id": "8080040850",
+    "login_url": "https://algeria.blsspainvisa.com/algiers/",
+    "app_url": "https://algeria.blsspainvisa.com/algiers/book-appointment",
+    "email": "your_email@example.com",
+    "password": "your_password",
+    "headless": False,  # يُوصى بـ False لموقع BLS لتجاوز Cloudflare
+    "check_interval_min": 180,
+    "check_interval_max": 300
 }
 
-CITIES = ['Ankara', 'Istanbul', 'Izmir', 'Antalya', 'Gaziantep', 'Bursa', 'Edirne', 'Algiers', 'Oran']
+def load_config():
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+                DEFAULT_CONFIG.update(saved)
+        except Exception as e:
+            print(f"خطأ في قراءة ملف الإعدادات: {e}")
+    DEFAULT_CONFIG["is_running"] = False
+    return DEFAULT_CONFIG
 
-# --- كلاس البوت الرئيسي ---
-class VisaBot:
-    def __init__(self):
-        self.app = None
-        self.active_tasks = {}  # {chat_id: asyncio.Task}
-        init_db()
+bot_status = load_config()
 
-    # لوحات المفاتيح التفاعلية
-    def create_frequency_keyboard(self):
-        keyboard = [
-            [InlineKeyboardButton(f"{i} Mins", callback_data=f"freq_{i}") for i in range(1, 6)]
-        ]
-        return InlineKeyboardMarkup(keyboard)
+def save_config_to_file():
+    with data_lock:
+        to_save = {k: v for k, v in bot_status.items() if k not in ["is_running", "logs"]}
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(to_save, f, ensure_ascii=False, indent=4)
 
-    def create_country_keyboard(self):
-        keyboard = []
-        row = []
-        for i, (eng_name, tr_name) in enumerate(COUNTRIES.items(), 1):
-            row.append(InlineKeyboardButton(tr_name, callback_data=f"country_{eng_name}"))
-            if i % 3 == 0:
-                keyboard.append(row)
-                row = []
-        if row:
-            keyboard.append(row)
-        return InlineKeyboardMarkup(keyboard)
+def add_log(message):
+    timestamp = time.strftime("[%H:%M:%S] ")
+    with data_lock:
+        bot_status["logs"].append(timestamp + message)
+        if len(bot_status["logs"]) > 100:
+            bot_status["logs"].pop(0)
 
-    def create_city_keyboard(self):
-        keyboard = []
-        row = []
-        for i, city in enumerate(CITIES, 1):
-            row.append(InlineKeyboardButton(city, callback_data=f"city_{city}"))
-            if i % 3 == 0:
-                keyboard.append(row)
-                row = []
-        if row:
-            keyboard.append(row)
-        return InlineKeyboardMarkup(keyboard)
+def send_telegram(msg, image_path=None):
+    token = bot_status.get("bot_token")
+    chat_id = bot_status.get("chat_id")
 
-    # معالجات الأوامر
-    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        chat_id = update.effective_chat.id
-        update_user(chat_id)
-        welcome_msg = (
-            "🌟 Welcome to the Schengen Visa Appointment Bot!\n\n"
-            "/check - Start appointment check\n"
-            "/stop - Stop active check\n"
-            "/status - Show current search status\n"
-            "/help - Command list"
-        )
-        await update.message.reply_text(welcome_msg)
+    if not token or not chat_id:
+        add_log("⚠️ بيانات التلغرام غير مكتملة.")
+        return False
 
-    async def help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        help_text = (
-            "📋 Commands:\n"
-            "/check - Select country & city to monitor\n"
-            "/stop - Cancel active monitoring\n"
-            "/status - View your current monitoring settings"
-        )
-        await update.message.reply_text(help_text)
-
-    async def check(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text("🌍 Select target country:", reply_markup=self.create_country_keyboard())
-
-    async def stop(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        chat_id = update.effective_chat.id
-        if chat_id in self.active_tasks:
-            await self.stop_user_task(chat_id)
-            await update.message.reply_text("🛑 Appointment monitoring stopped.")
-        else:
-            await update.message.reply_text("ℹ️ You have no active monitoring task.")
-
-    async def status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        chat_id = update.effective_chat.id
-        user_data = get_user(chat_id)
-        if user_data and user_data["is_active"]:
-            country_tr = COUNTRIES.get(user_data['country'], user_data['country'])
-            msg = (
-                f"📊 **Active Monitoring Status**\n\n"
-                f"📍 **Country:** {country_tr}\n"
-                f"🏢 **City:** {user_data['city']}\n"
-                f"⏱ **Interval:** {user_data['frequency']} minutes\n"
-                f"✅ **Status:** Running"
-            )
-        else:
-            msg = "ℹ️ No active monitoring task. Use /check to start."
-        await update.message.reply_text(msg, parse_mode="Markdown")
-
-    async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.callback_query
-        await query.answer()
-        chat_id = update.effective_chat.id
-        data = query.data
-
-        if data.startswith("country_"):
-            country_eng = data.split("_", 1)[1]
-            update_user(chat_id, country=country_eng)
-            country_tr = COUNTRIES.get(country_eng, country_eng)
-            await query.edit_message_text(
-                f"✅ Country selected: {country_tr}\n🏢 Select target city:",
-                reply_markup=self.create_city_keyboard()
-            )
-
-        elif data.startswith("city_"):
-            city_selected = data.split("_", 1)[1]
-            update_user(chat_id, city=city_selected)
-            user_data = get_user(chat_id)
-            if user_data and user_data["country"]:
-                await query.edit_message_text(
-                    f"📍 Selected: {COUNTRIES.get(user_data['country'])} - {city_selected}\n"
-                    f"⏱ Select check frequency:",
-                    reply_markup=self.create_frequency_keyboard()
+    try:
+        if image_path and os.path.exists(image_path):
+            url = f"https://api.telegram.org/bot{token}/sendPhoto"
+            with open(image_path, "rb") as photo:
+                res = requests.post(
+                    url,
+                    data={"chat_id": chat_id, "caption": msg, "parse_mode": "Markdown"},
+                    files={"photo": photo},
+                    timeout=15
                 )
-            else:
-                await query.edit_message_text("❌ Please select a country first with /check.")
+        else:
+            url = f"https://api.telegram.org/bot{token}/sendMessage"
+            res = requests.post(
+                url,
+                json={"chat_id": chat_id, "text": msg, "parse_mode": "Markdown"},
+                timeout=10
+            )
+        return res.status_code == 200
+    except Exception as e:
+        add_log(f"خطأ إرسال تلغرام: {e}")
+        return False
 
-        elif data.startswith("freq_"):
-            freq = int(data.split("_")[1])
-            user_data = get_user(chat_id)
-            if user_data and user_data["country"] and user_data["city"]:
-                country = user_data["country"]
-                city = user_data["city"]
-                await self.start_user_task(chat_id, country, city, freq)
-                country_tr = COUNTRIES.get(country, country)
-                await query.edit_message_text(
-                    f"🚀 **Monitoring Started!**\n\n"
-                    f"📍 Country: {country_tr}\n"
-                    f"🏢 City: {city}\n"
-                    f"⏱ Interval: {freq} minutes\n\n"
-                    f"You will receive a notification as soon as a slot opens up.",
-                    parse_mode="Markdown"
-                )
-            else:
-                await query.edit_message_text("❌ Missing configuration. Please restart with /check.")
+def get_chromedriver():
+    options = uc.ChromeOptions()
+    if bot_status.get("headless", False):
+        options.add_argument('--headless=new')
+    
+    options.add_argument('--no-sandbox')
+    options.add_argument('--disable-dev-shm-usage')
+    options.add_argument('--disable-gpu')
+    options.add_argument('--window-size=1920,1080')
+    options.add_argument('--disable-blink-features=AutomationControlled')
+    options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36')
+    
+    driver = uc.Chrome(options=options)
+    driver.set_page_load_timeout(40)
+    return driver
 
-    # إدارة المهام المنفصلة لكل مستخدم
-    async def start_user_task(self, chat_id, country, city, frequency):
-        await self.stop_user_task(chat_id)
-        update_user(chat_id, country=country, city=city, frequency=frequency, is_active=1)
-        task = asyncio.create_task(self.check_appointments_for_user(chat_id, country, city, frequency))
-        self.active_tasks[chat_id] = task
+def run_visa_check():
+    driver = None
+    try:
+        add_log("🔍 جاري فتح موقع BLS Spain (الجزائر)...")
+        driver = get_chromedriver()
+        wait = WebDriverWait(driver, 20)
 
-    async def stop_user_task(self, chat_id):
-        update_user(chat_id, is_active=0)
-        if chat_id in self.active_tasks:
-            self.active_tasks[chat_id].cancel()
+        # 1. فتح الصفحة الرئيسية
+        driver.get(bot_status["login_url"])
+        time.sleep(3)
+
+        # تطبيق الكوكيز السابقة إن وجدت
+        if os.path.exists(COOKIES_FILE):
             try:
-                await self.active_tasks[chat_id]
-            except asyncio.CancelledError:
+                with open(COOKIES_FILE, "rb") as f:
+                    for c in pickle.load(f):
+                        driver.add_cookie(c)
+                driver.refresh()
+                time.sleep(3)
+                add_log("تم تحميل الجلسة المحفوظة عبر الكوكيز.")
+            except Exception as e:
+                add_log(f"تعذر استعادة الكوكيز: {e}")
+
+        # 2. الانتقال إلى صفحة المواعيد
+        driver.get(bot_status["app_url"])
+        time.sleep(5)
+
+        # حفظ الكوكيز الحالية لاستمرار الجلسة
+        try:
+            with open(COOKIES_FILE, "wb") as f:
+                pickle.dump(driver.get_cookies(), f)
+        except Exception:
+            pass
+
+        # 3. فحص خانات المواعيد المتاحة
+        # البحث عن عناصر المواعيد المتاحة أو خانات الاختيار النشطة في BLS
+        available_slots = driver.find_elements(By.XPATH, "//td[contains(@class, 'day') and not(contains(@class, 'disabled'))]")
+        if not available_slots:
+            available_slots = driver.find_elements(By.CLASS_NAME, "available-slot")
+
+        if len(available_slots) > 0:
+            msg = f"🚨 *تم العثور على مواعيد متاحة في BLS Spain (الجزائر)!*\nعدد الخانات المتاحة: {len(available_slots)}\nرابط الموقع: {bot_status['app_url']}"
+            add_log(msg)
+            
+            # التقاط صورة وإرسالها تلغرام
+            driver.save_screenshot(SCREENSHOT_FILE)
+            send_telegram(msg, image_path=SCREENSHOT_FILE)
+        else:
+            add_log("لا توجد مواعيد متاحة حالياً على موقع BLS.")
+
+    except Exception as e:
+        add_log(f"حدث خطأ أثناء الفحص: {e}")
+    finally:
+        if driver:
+            try:
+                driver.quit()
+            except Exception:
                 pass
-            del self.active_tasks[chat_id]
 
-    async def resume_active_searches(self):
-        active_users = get_all_active_users()
-        for chat_id, country, city, frequency in active_users:
-            if country and city:
-                task = asyncio.create_task(self.check_appointments_for_user(chat_id, country, city, frequency))
-                self.active_tasks[chat_id] = task
-        logger.info(f"Resumed active searches for {len(active_users)} users.")
+def bot_loop():
+    send_telegram("🌐 *تم تشغيل البوت لمراقبة مواعيد BLS Spain (الجزائر)!*")
+    
+    while bot_status["is_running"]:
+        run_visa_check()
+        
+        if not bot_status["is_running"]:
+            break
+            
+        delay = random.uniform(bot_status.get("check_interval_min", 180), bot_status.get("check_interval_max", 300))
+        add_log(f"انتظار {int(delay)} ثانية حتى الجولة القادمة...")
+        
+        for _ in range(int(delay)):
+            if not bot_status["is_running"]:
+                break
+            time.sleep(1)
 
-    async def check_appointments_for_user(self, chat_id, country, city, frequency):
-        async with aiohttp.ClientSession() as session:
-            while True:
-                try:
-                    logger.info(f"Checking for user {chat_id}: {country} - {city}")
-                    async with session.get(API_URL, timeout=30) as response:
-                        if response.status == 200:
-                            data = await response.json()
-                            for appointment in data:
-                                source = appointment.get('source_country')
-                                mission = appointment.get('mission_country', '')
-                                center = appointment.get('center_name', '')
+    send_telegram("🛑 *تم إيقاف تشغيل بوت المواعيد.*")
 
-                                if (
-                                    source in ['Turkiye', 'Algeria']
-                                    and country == mission
-                                    and center and city.lower() in center.lower()
-                                ):
-                                    appointment_date = appointment.get('appointment_date')
-                                    if appointment_date:
-                                        try:
-                                            date_obj = datetime.fromisoformat(appointment_date.replace('Z', '+00:00'))
-                                            tr_date = date_obj.astimezone(ZoneInfo('Europe/Istanbul'))
-                                            formatted_date = tr_date.strftime('%d.%m.%Y %H:%M')
-                                        except Exception:
-                                            formatted_date = appointment_date
-                                    else:
-                                        formatted_date = 'No date info'
+# --- الواجهة الخاصة بالسيرفر ---
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>لوحة بوت مواعيد BLS Spain - الجزائر</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.rtl.min.css" rel="stylesheet">
+    <style>
+        body { background-color: #f4f6f9; font-family: system-ui, -apple-system, sans-serif; }
+        .log-box { background: #1e1e1e; color: #00ff66; font-family: monospace; height: 260px; overflow-y: scroll; padding: 12px; border-radius: 6px; font-size: 13px; line-height: 1.5; }
+        .card { border-radius: 10px; border: none; box-shadow: 0 2px 10px rgba(0,0,0,0.08); }
+    </style>
+</head>
+<body class="p-2 p-md-4">
+    <div class="container card p-3 p-md-4 bg-white" style="max-width: 600px;">
+        <h4 class="text-center mb-3 text-danger">🇪🇸 لوحة بوت مواعيد BLS Spain (الجزائر)</h4>
+        
+        <div class="alert text-center fw-bold" id="statusBadge">جاري التحميل...</div>
 
-                                    msg = (
-                                        f"🎉 **Appointment Found!**\n\n"
-                                        f"📍 Country: {COUNTRIES.get(country, country)}\n"
-                                        f"🏢 Center: {center}\n"
-                                        f"📅 Date: {formatted_date}\n"
-                                        f"📋 Category: {appointment.get('visa_category', 'Not specified')}\n"
-                                        f"🔗 Link: {appointment.get('book_now_link', '#')}"
-                                    )
-                                    await self.app.bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
+        <div class="row g-2 mb-3">
+            <div class="col-6">
+                <button class="btn btn-success w-100 btn-lg" onclick="controlBot('start')">▶ بدء المراقبة</button>
+            </div>
+            <div class="col-6">
+                <button class="btn btn-danger w-100 btn-lg" onclick="controlBot('stop')">⏹ إيقاف البوت</button>
+            </div>
+            <div class="col-6">
+                <button class="btn btn-warning w-100 text-dark" onclick="controlBot('check_now')">⚡ فحص فوري الآن</button>
+            </div>
+            <div class="col-6">
+                <button class="btn btn-info w-100 text-white" onclick="testTelegram()">📩 اختبار التلغرام</button>
+            </div>
+        </div>
 
-                except asyncio.CancelledError:
-                    break
-                except Exception as e:
-                    logger.error(f"Error for user {chat_id}: {str(e)}")
+        <form id="configForm" class="mb-3">
+            <div class="mb-2">
+                <label class="form-label fw-bold">رابط الموقع (BLS Home):</label>
+                <input type="url" class="form-control" name="login_url" value="{{ config.login_url }}" required>
+            </div>
+            <div class="mb-2">
+                <label class="form-label fw-bold">رابط صفحة حجز المواعيد (Appointments URL):</label>
+                <input type="url" class="form-control" name="app_url" value="{{ config.app_url }}" required>
+            </div>
+            <hr>
+            <div class="row g-2 mb-2">
+                <div class="col-6">
+                    <label class="form-label">البريد الإلكتروني:</label>
+                    <input type="email" class="form-control" name="email" value="{{ config.email }}">
+                </div>
+                <div class="col-6">
+                    <label class="form-label">كلمة المرور:</label>
+                    <input type="password" class="form-control" name="password" value="{{ config.password }}">
+                </div>
+            </div>
+            <div class="row g-2 mb-2">
+                <div class="col-6">
+                    <label class="form-label">Telegram Token:</label>
+                    <input type="text" class="form-control" name="bot_token" value="{{ config.bot_token }}">
+                </div>
+                <div class="col-6">
+                    <label class="form-label">Chat ID:</label>
+                    <input type="text" class="form-control" name="chat_id" value="{{ config.chat_id }}">
+                </div>
+            </div>
+            <div class="form-check form-switch my-3">
+                <input class="form-check-input" type="checkbox" name="headless" id="headlessSwitch" {% if config.headless %}checked{% endif %}>
+                <label class="form-check-label fw-bold" for="headlessSwitch">التشغيل المخفي بدون نافذة (غير موصى به مع BLS)</label>
+            </div>
+            <button type="button" class="btn btn-primary w-100 mt-2 fw-bold" onclick="saveConfig()">💾 حفظ الإعدادات</button>
+        </form>
 
-                await asyncio.sleep(frequency * 60)
+        <div class="d-flex justify-content-between align-items-center mb-2">
+            <h6 class="m-0">سجل العمليات (Logs)</h6>
+            <button class="btn btn-sm btn-outline-secondary" onclick="clearLogs()">مسح السجل</button>
+        </div>
+        <div class="log-box" id="logBox"></div>
+    </div>
 
-    async def run(self):
-        self.app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-        commands = [
-            BotCommand("start", "Bot info"),
-            BotCommand("help", "Help menu"),
-            BotCommand("check", "Start check"),
-            BotCommand("stop", "Stop check"),
-            BotCommand("status", "Status info")
-        ]
+    <script>
+        function updateUI() {
+            fetch('/api/status')
+                .then(r => r.json())
+                .then(data => {
+                    const badge = document.getElementById('statusBadge');
+                    if(data.is_running) {
+                        badge.className = 'alert alert-success text-center fw-bold';
+                        badge.innerText = 'الحالة: يعمل ويراقب...';
+                    } else {
+                        badge.className = 'alert alert-danger text-center fw-bold';
+                        badge.innerText = 'الحالة: متوقف';
+                    }
+                    const logBox = document.getElementById('logBox');
+                    logBox.innerHTML = data.logs.join('<br>');
+                    logBox.scrollTop = logBox.scrollHeight;
+                });
+        }
 
-        self.app.add_handler(CommandHandler("start", self.start))
-        self.app.add_handler(CommandHandler("help", self.help))
-        self.app.add_handler(CommandHandler("check", self.check))
-        self.app.add_handler(CommandHandler("stop", self.stop))
-        self.app.add_handler(CommandHandler("status", self.status))
-        self.app.add_handler(CallbackQueryHandler(self.button_callback))
+        function controlBot(action) {
+            fetch('/api/' + action, {method: 'POST'}).then(() => updateUI());
+        }
 
-        await self.app.initialize()
-        await self.app.start()
-        await self.app.bot.set_my_commands(commands)
-        await self.app.updater.start_polling(allowed_updates=["message", "callback_query"], drop_pending_updates=True)
+        function testTelegram() {
+            fetch('/api/test_telegram', {method: 'POST'})
+                .then(r => r.json())
+                .then(d => alert(d.message));
+        }
 
-        # استعادة جميع الفحوصات النشطة من قاعدة البيانات
-        await self.resume_active_searches()
+        function clearLogs() {
+            fetch('/api/clear_logs', {method: 'POST'}).then(() => updateUI());
+        }
 
-        while True:
-            await asyncio.sleep(1)
+        function saveConfig() {
+            const formData = new FormData(document.getElementById('configForm'));
+            formData.set('headless', document.getElementById('headlessSwitch').checked);
+            fetch('/api/save', {method: 'POST', body: formData})
+                .then(() => alert('تم حفظ بيانات BLS بنجاح!'));
+        }
 
-async def main():
-    if not TELEGRAM_BOT_TOKEN:
-        logger.error("❌ TELEGRAM_BOT_TOKEN is missing!")
-        return
+        setInterval(updateUI, 3000);
+        updateUI();
+    </script>
+</body>
+</html>
+"""
 
-    threading.Thread(target=run_flask, daemon=True).start()
+# --- مارات API ---
 
-    bot = VisaBot()
-    await bot.run()
+@app.route('/')
+def index():
+    return render_template_string(HTML_TEMPLATE, config=bot_status)
 
-if __name__ == "__main__":
-    asyncio.run(main())
+@app.route('/api/status')
+def get_status():
+    return jsonify({"is_running": bot_status["is_running"], "logs": bot_status["logs"]})
+
+@app.route('/api/start', methods=['POST'])
+def start_bot():
+    if not bot_status["is_running"]:
+        bot_status["is_running"] = True
+        threading.Thread(target=bot_loop, daemon=True).start()
+    return jsonify({"success": True})
+
+@app.route('/api/stop', methods=['POST'])
+def stop_bot():
+    bot_status["is_running"] = False
+    return jsonify({"success": True})
+
+@app.route('/api/check_now', methods=['POST'])
+def check_now():
+    threading.Thread(target=run_visa_check, daemon=True).start()
+    return jsonify({"success": True})
+
+@app.route('/api/test_telegram', methods=['POST'])
+def test_telegram_route():
+    ok = send_telegram("🧪 *رسالة تجريبية من بوت مواعيد BLS Spain.*")
+    msg = "تم إرسال الرسالة بنجاح!" if ok else "فشل الإرسال، تحقق من بيانات التلغرام."
+    return jsonify({"message": msg})
+
+@app.route('/api/clear_logs', methods=['POST'])
+def clear_logs():
+    with data_lock:
+        bot_status["logs"] = []
+    return jsonify({"success": True})
+
+@app.route('/api/save', methods=['POST'])
+def save_config():
+    bot_status["login_url"] = request.form.get("login_url")
+    bot_status["app_url"] = request.form.get("app_url")
+    bot_status["email"] = request.form.get("email")
+    bot_status["password"] = request.form.get("password")
+    bot_status["bot_token"] = request.form.get("bot_token")
+    bot_status["chat_id"] = request.form.get("chat_id")
+    bot_status["headless"] = request.form.get("headless") == 'true'
+    
+    save_config_to_file()
+    return jsonify({"success": True})
+
+if __name__ == '__main__':
+    add_log("تم تشغيل لوحة التحكم لبوت BLS Spain.")
+    app.run(host='0.0.0.0', port=5000)
