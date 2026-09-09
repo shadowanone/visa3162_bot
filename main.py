@@ -2,7 +2,7 @@
 import os
 import sys
 import logging
-import json
+import sqlite3
 import asyncio
 import aiohttp
 import threading
@@ -16,7 +16,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotComm
 # تحميل المتغيرات البيئية
 load_dotenv()
 
-# إعدادات التسجيل (Logging)
+# إعداد التسجيل (Logging)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -24,23 +24,59 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# خادم Flask لإبقاء الخدمة نشطة على Render
+# --- إعداد خادم Flask لتجاوز فحص المنفذ على Render ---
 flask_app = Flask(__name__)
 
 @flask_app.route('/')
 def home():
-    return "✅ Telegram Visa Bot is running smoothly!"
+    return "✅ Telegram Visa Bot (Multi-User) is active!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
     flask_app.run(host="0.0.0.0", port=port)
 
-# جلب الإعدادات من البيئة
+# --- إعداد قاعدة بيانات SQLite ---
+DB_NAME = "bot_users.db"
+
+def init_db():
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                chat_id INTEGER PRIMARY KEY,
+                country TEXT,
+                city TEXT,
+                frequency INTEGER DEFAULT 5,
+                is_active INTEGER DEFAULT 0
+            )
+        ''')
+        conn.commit()
+
+def update_user(chat_id, **kwargs):
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute("INSERT OR IGNORE INTO users (chat_id) VALUES (?)", (chat_id,))
+        for key, value in kwargs.items():
+            cursor.execute(f"UPDATE users SET {key} = ? WHERE chat_id = ?", (value, chat_id))
+        conn.commit()
+
+def get_user(chat_id):
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT country, city, frequency, is_active FROM users WHERE chat_id = ?", (chat_id,))
+        row = cursor.fetchone()
+        return {"country": row[0], "city": row[1], "frequency": row[2], "is_active": row[3]} if row else None
+
+def get_all_active_users():
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT chat_id, country, city, frequency FROM users WHERE is_active = 1")
+        return cursor.fetchall()
+
+# --- الثوابت والإعدادات ---
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 API_URL = "https://api.schengenvisaappointments.com/api/visa-list/?format=json"
 
-# قائمة الدول المتاحة
 COUNTRIES = {
     'Spain': 'İspanya',
     'France': 'Fransa',
@@ -64,19 +100,17 @@ COUNTRIES = {
 
 CITIES = ['Ankara', 'Istanbul', 'Izmir', 'Antalya', 'Gaziantep', 'Bursa', 'Edirne', 'Algiers', 'Oran']
 
+# --- كلاس البوت الرئيسي ---
 class VisaBot:
     def __init__(self):
         self.app = None
-        self.running = False
-        self.current_check = None
-        self.country = None
-        self.city = None
-        self.frequency = 5
-        self.user_selections = {}
+        self.active_tasks = {}  # {chat_id: asyncio.Task}
+        init_db()
 
+    # لوحات المفاتيح التفاعلية
     def create_frequency_keyboard(self):
         keyboard = [
-            [InlineKeyboardButton(f"{i} Minutes", callback_data=f"freq_{i}") for i in range(1, 6)]
+            [InlineKeyboardButton(f"{i} Mins", callback_data=f"freq_{i}") for i in range(1, 6)]
         ]
         return InlineKeyboardMarkup(keyboard)
 
@@ -104,157 +138,144 @@ class VisaBot:
             keyboard.append(row)
         return InlineKeyboardMarkup(keyboard)
 
-    async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        try:
-            query = update.callback_query
-            await query.answer()
-            user_id = str(update.effective_user.id)
-
-            if user_id not in self.user_selections:
-                self.user_selections[user_id] = {}
-
-            data = query.data
-            await query.edit_message_text("⏳ Processing... Please wait.")
-
-            if data.startswith("freq_"):
-                self.frequency = int(data.split("_")[1])
-                if self.running:
-                    await self.stop_checking()
-                    self.running = True
-                    self.current_check = asyncio.create_task(self.check_appointments())
-                await query.edit_message_text(f"✅ Check frequency set to {self.frequency} minutes.")
-
-            elif data.startswith("country_"):
-                selected_country_eng = data.split("_", 1)[1]
-                if selected_country_eng in COUNTRIES:
-                    selected_country_tr = COUNTRIES[selected_country_eng]
-                    self.user_selections[user_id] = {"country": selected_country_eng}
-                    self.country = selected_country_eng
-                    await query.edit_message_text(
-                        f"✅ {selected_country_tr} selected.\n🏢 Please select a city:",
-                        reply_markup=self.create_city_keyboard()
-                    )
-
-            elif data.startswith("city_"):
-                selected_city = data.split("_", 1)[1]
-                self.user_selections[user_id]["city"] = selected_city
-                if "country" in self.user_selections[user_id]:
-                    selected_country = self.user_selections[user_id]["country"]
-                    await self.start_check_with_selections(update, selected_country, selected_city)
-                else:
-                    await query.edit_message_text("❌ Please select a country first.")
-
-        except Exception as e:
-            logger.error(f"Callback processing error: {str(e)}")
-
-    async def start_check_with_selections(self, update, country, city):
-        if self.running:
-            await self.stop_checking()
-
-        self.country = country
-        self.city = city
-        self.running = True
-        country_tr = COUNTRIES.get(country, country)
-
-        message = (
-            f"✅ Appointment check started for {country_tr} in {city}.\n"
-            f"⏱ Select the check frequency:"
-        )
-
-        if hasattr(update, "callback_query"):
-            await update.callback_query.edit_message_text(message, reply_markup=self.create_frequency_keyboard())
-        else:
-            await update.message.reply_text(message, reply_markup=self.create_frequency_keyboard())
-
-        self.current_check = asyncio.create_task(self.check_appointments())
-
-        if TELEGRAM_CHAT_ID:
-            try:
-                start_message = (
-                    f"🔄 Appointment check started\n"
-                    f"📍 Country: {country_tr}\n"
-                    f"🏢 City: {city}\n"
-                    f"⏱ Check frequency: {self.frequency} minutes\n"
-                    f"⏰ Start: {datetime.now().strftime('%d.%m.%Y %H:%M')}"
-                )
-                await self.app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=start_message)
-            except Exception as e:
-                logger.error(f"Error sending start message: {str(e)}")
-
+    # معالجات الأوامر
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        welcome_message = (
-            "🌟 Welcome to the Schengen Visa Appointment Check Bot!\n\n"
-            "/start - Bot information\n"
+        chat_id = update.effective_chat.id
+        update_user(chat_id)
+        welcome_msg = (
+            "🌟 Welcome to the Schengen Visa Appointment Bot!\n\n"
             "/check - Start appointment check\n"
             "/stop - Stop active check\n"
-            "/status - Current status information\n"
-            "/help - Help menu"
+            "/status - Show current search status\n"
+            "/help - Command list"
         )
-        await update.message.reply_text(welcome_message)
+        await update.message.reply_text(welcome_msg)
 
     async def help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         help_text = (
-            "📋 Command List:\n"
-            "/check - Start Appointment Check\n"
-            "/stop - Stop Check\n"
-            "/status - Check Status"
+            "📋 Commands:\n"
+            "/check - Select country & city to monitor\n"
+            "/stop - Cancel active monitoring\n"
+            "/status - View your current monitoring settings"
         )
         await update.message.reply_text(help_text)
 
     async def check(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text("🌍 Please select a country:", reply_markup=self.create_country_keyboard())
+        await update.message.reply_text("🌍 Select target country:", reply_markup=self.create_country_keyboard())
 
     async def stop(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self.running:
-            await update.message.reply_text("ℹ️ No active check.")
-            return
-        await self.stop_checking()
-        await update.message.reply_text("✅ Appointment check stopped.")
+        chat_id = update.effective_chat.id
+        if chat_id in self.active_tasks:
+            await self.stop_user_task(chat_id)
+            await update.message.reply_text("🛑 Appointment monitoring stopped.")
+        else:
+            await update.message.reply_text("ℹ️ You have no active monitoring task.")
 
     async def status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self.running:
-            await update.message.reply_text("ℹ️ No active check.")
-            return
-        status_message = (
-            f"📍 Country: {self.country}\n"
-            f"🏢 City: {self.city}\n"
-            f"⏱ Frequency: {self.frequency} mins\n"
-            "✅ Status: Active"
-        )
-        await update.message.reply_text(status_message)
+        chat_id = update.effective_chat.id
+        user_data = get_user(chat_id)
+        if user_data and user_data["is_active"]:
+            country_tr = COUNTRIES.get(user_data['country'], user_data['country'])
+            msg = (
+                f"📊 **Active Monitoring Status**\n\n"
+                f"📍 **Country:** {country_tr}\n"
+                f"🏢 **City:** {user_data['city']}\n"
+                f"⏱ **Interval:** {user_data['frequency']} minutes\n"
+                f"✅ **Status:** Running"
+            )
+        else:
+            msg = "ℹ️ No active monitoring task. Use /check to start."
+        await update.message.reply_text(msg, parse_mode="Markdown")
 
-    async def stop_checking(self):
-        self.running = False
-        if self.current_check:
-            self.current_check.cancel()
+    async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        await query.answer()
+        chat_id = update.effective_chat.id
+        data = query.data
+
+        if data.startswith("country_"):
+            country_eng = data.split("_", 1)[1]
+            update_user(chat_id, country=country_eng)
+            country_tr = COUNTRIES.get(country_eng, country_eng)
+            await query.edit_message_text(
+                f"✅ Country selected: {country_tr}\n🏢 Select target city:",
+                reply_markup=self.create_city_keyboard()
+            )
+
+        elif data.startswith("city_"):
+            city_selected = data.split("_", 1)[1]
+            update_user(chat_id, city=city_selected)
+            user_data = get_user(chat_id)
+            if user_data and user_data["country"]:
+                await query.edit_message_text(
+                    f"📍 Selected: {COUNTRIES.get(user_data['country'])} - {city_selected}\n"
+                    f"⏱ Select check frequency:",
+                    reply_markup=self.create_frequency_keyboard()
+                )
+            else:
+                await query.edit_message_text("❌ Please select a country first with /check.")
+
+        elif data.startswith("freq_"):
+            freq = int(data.split("_")[1])
+            user_data = get_user(chat_id)
+            if user_data and user_data["country"] and user_data["city"]:
+                country = user_data["country"]
+                city = user_data["city"]
+                await self.start_user_task(chat_id, country, city, freq)
+                country_tr = COUNTRIES.get(country, country)
+                await query.edit_message_text(
+                    f"🚀 **Monitoring Started!**\n\n"
+                    f"📍 Country: {country_tr}\n"
+                    f"🏢 City: {city}\n"
+                    f"⏱ Interval: {freq} minutes\n\n"
+                    f"You will receive a notification as soon as a slot opens up.",
+                    parse_mode="Markdown"
+                )
+            else:
+                await query.edit_message_text("❌ Missing configuration. Please restart with /check.")
+
+    # إدارة المهام المنفصلة لكل مستخدم
+    async def start_user_task(self, chat_id, country, city, frequency):
+        await self.stop_user_task(chat_id)
+        update_user(chat_id, country=country, city=city, frequency=frequency, is_active=1)
+        task = asyncio.create_task(self.check_appointments_for_user(chat_id, country, city, frequency))
+        self.active_tasks[chat_id] = task
+
+    async def stop_user_task(self, chat_id):
+        update_user(chat_id, is_active=0)
+        if chat_id in self.active_tasks:
+            self.active_tasks[chat_id].cancel()
             try:
-                await self.current_check
+                await self.active_tasks[chat_id]
             except asyncio.CancelledError:
                 pass
-        self.current_check = None
+            del self.active_tasks[chat_id]
 
-    async def check_appointments(self):
-        check_count = 0
+    async def resume_active_searches(self):
+        active_users = get_all_active_users()
+        for chat_id, country, city, frequency in active_users:
+            if country and city:
+                task = asyncio.create_task(self.check_appointments_for_user(chat_id, country, city, frequency))
+                self.active_tasks[chat_id] = task
+        logger.info(f"Resumed active searches for {len(active_users)} users.")
+
+    async def check_appointments_for_user(self, chat_id, country, city, frequency):
         async with aiohttp.ClientSession() as session:
-            while self.running:
-                check_count += 1
+            while True:
                 try:
-                    logger.info(f"Checking appointments for {self.country} - {self.city} (#{check_count})")
+                    logger.info(f"Checking for user {chat_id}: {country} - {city}")
                     async with session.get(API_URL, timeout=30) as response:
                         if response.status == 200:
                             data = await response.json()
-                            available_appointments = []
-
                             for appointment in data:
                                 source = appointment.get('source_country')
                                 mission = appointment.get('mission_country', '')
                                 center = appointment.get('center_name', '')
 
-                                # دعم تركيا والجزائر
                                 if (
                                     source in ['Turkiye', 'Algeria']
-                                    and self.country == mission
-                                    and center and self.city and self.city.lower() in center.lower()
+                                    and country == mission
+                                    and center and city.lower() in center.lower()
                                 ):
                                     appointment_date = appointment.get('appointment_date')
                                     if appointment_date:
@@ -267,30 +288,22 @@ class VisaBot:
                                     else:
                                         formatted_date = 'No date info'
 
-                                    available_appointments.append({
-                                        'date': formatted_date,
-                                        'center': center,
-                                        'category': appointment.get('visa_category', 'Not specified'),
-                                        'link': appointment.get('book_now_link', '#')
-                                    })
-
-                            if available_appointments and TELEGRAM_CHAT_ID:
-                                for appt in available_appointments:
                                     msg = (
-                                        f"🎉 Appointment found for {self.country}!\n\n"
-                                        f"📍 Center: {appt['center']}\n"
-                                        f"📅 Date: {appt['date']}\n"
-                                        f"📋 Category: {appt['category']}\n"
-                                        f"🔗 Link:\n{appt['link']}"
+                                        f"🎉 **Appointment Found!**\n\n"
+                                        f"📍 Country: {COUNTRIES.get(country, country)}\n"
+                                        f"🏢 Center: {center}\n"
+                                        f"📅 Date: {formatted_date}\n"
+                                        f"📋 Category: {appointment.get('visa_category', 'Not specified')}\n"
+                                        f"🔗 Link: {appointment.get('book_now_link', '#')}"
                                     )
-                                    await self.app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
+                                    await self.app.bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
 
                 except asyncio.CancelledError:
                     break
                 except Exception as e:
-                    logger.error(f"Error during check: {str(e)}")
+                    logger.error(f"Error for user {chat_id}: {str(e)}")
 
-                await asyncio.sleep(self.frequency * 60)
+                await asyncio.sleep(frequency * 60)
 
     async def run(self):
         self.app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
@@ -314,15 +327,17 @@ class VisaBot:
         await self.app.bot.set_my_commands(commands)
         await self.app.updater.start_polling(allowed_updates=["message", "callback_query"], drop_pending_updates=True)
 
+        # استعادة جميع الفحوصات النشطة من قاعدة البيانات
+        await self.resume_active_searches()
+
         while True:
             await asyncio.sleep(1)
 
 async def main():
     if not TELEGRAM_BOT_TOKEN:
-        print("❌ TELEGRAM_BOT_TOKEN is missing!")
+        logger.error("❌ TELEGRAM_BOT_TOKEN is missing!")
         return
 
-    # تشغيل سيرفر Flask في Thread منفصل لفتح منفذ HTTP لـ Render
     threading.Thread(target=run_flask, daemon=True).start()
 
     bot = VisaBot()
